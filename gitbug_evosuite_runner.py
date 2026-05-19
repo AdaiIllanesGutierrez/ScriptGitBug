@@ -6,6 +6,49 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 
+"""
+For java 8
+export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+export PATH="$JAVA_HOME/bin:$PATH"
+"""
+
+
+def _docker_prefix(image: str, cwd: Path, *extra_mounts: Path) -> List[str]:
+    """
+    Build the 'docker run' prefix that wraps a Java/Maven command.
+
+    All paths are mounted at the same absolute location inside the container so
+    that classpath strings written by Maven (cp.txt) resolve without translation.
+
+    --user {uid}:{gid} ensures files created inside Docker (Maven target/,
+    EvoSuite tests, cp.txt) are owned by the host user, so shutil.rmtree
+    on subsequent runs does not fail with PermissionError.
+
+    --network=host lets EvoSuite's RMI communicate the same as on the host.
+    """
+    seen: set = set()
+    vol_args: List[str] = []
+    for p in (cwd, *extra_mounts):
+        s = str(p)
+        if s not in seen:
+            seen.add(s)
+            vol_args += ["-v", f"{s}:{s}"]
+
+    import os
+    uid = os.getuid()
+    gid = os.getgid()
+    home = os.path.expanduser("~")
+
+    return [
+        "docker", "run", "--rm",
+        "--network=host",
+        "--user", f"{uid}:{gid}",
+        "-e", f"HOME={home}",
+        *vol_args,
+        "-w", str(cwd),
+        image,
+    ]
+
 
 def run_cmd(cmd: List[str], cwd: Path | None = None, check: bool = True) -> Tuple[int, str, str]:
     """
@@ -77,7 +120,13 @@ def checkout_version(gitbug_repo: Path, bug_id: str, out_dir: Path, fixed: bool)
     run_cmd(cmd, cwd=gitbug_repo)
 
 
-def compile_maven_project(project_dir: Path, log_dir: Path, prefix: str) -> str:
+def compile_maven_project(
+    project_dir: Path,
+    log_dir: Path,
+    prefix: str,
+    docker_image: str | None = None,
+    m2_dir: Path | None = None,
+) -> str:
     """
     Compile a Maven project and build its dependency classpath.
 
@@ -87,9 +136,18 @@ def compile_maven_project(project_dir: Path, log_dir: Path, prefix: str) -> str:
     Returns a classpath string that includes target/classes and Maven
     dependencies.
     """
+    extra = [m2_dir] if m2_dir else []
+    prefix_docker = _docker_prefix(docker_image, project_dir, *extra) if docker_image else []
+    cwd = None if docker_image else project_dir
+
+    # When running inside Docker as root, user.home=/root so Maven would write
+    # /root/.m2 paths into cp.txt. We force the local repo to the mounted path
+    # so all classpath entries are resolvable inside the container.
+    repo_flag = [f"-Dmaven.repo.local={m2_dir}/repository"] if (docker_image and m2_dir) else []
+
     code, out, err = run_cmd(
-        ["mvn", "-q", "-DskipTests", "-Dmaven.javadoc.skip=true", "compile"],
-        cwd=project_dir,
+        prefix_docker + ["mvn", "-q", "-DskipTests", "-Dmaven.javadoc.skip=true", "compile"] + repo_flag,
+        cwd=cwd,
     )
     write_log(log_dir, f"{prefix}_mvn_compile.log", out, err)
 
@@ -97,8 +155,8 @@ def compile_maven_project(project_dir: Path, log_dir: Path, prefix: str) -> str:
         raise RuntimeError(f"Maven compile failed for {project_dir}")
 
     code, out, err = run_cmd(
-        ["mvn", "-q", "dependency:build-classpath", "-Dmdep.outputFile=cp.txt"],
-        cwd=project_dir,
+        prefix_docker + ["mvn", "-q", "dependency:build-classpath", "-Dmdep.outputFile=cp.txt"] + repo_flag,
+        cwd=cwd,
     )
     write_log(log_dir, f"{prefix}_mvn_classpath.log", out, err)
 
@@ -121,6 +179,9 @@ def run_evosuite(
     evosuite_jar: Path,
     heap: str,
     log_dir: Path,
+    seed: int | None = None,
+    docker_image: str | None = None,
+    m2_dir: Path | None = None,
 ) -> None:
     """
     Run EvoSuite on the fixed version.
@@ -143,7 +204,19 @@ def run_evosuite(
         classpath,
     ]
 
-    code, out, err = run_cmd(cmd, cwd=fixed_dir, check=False)
+    if seed is not None:
+        cmd += ["-seed", str(seed)]
+
+    if docker_image:
+        extra = [evosuite_jar]
+        if m2_dir:
+            extra.append(m2_dir)
+        cmd = _docker_prefix(docker_image, fixed_dir, *extra) + cmd
+        cwd = None
+    else:
+        cwd = fixed_dir
+
+    code, out, err = run_cmd(cmd, cwd=cwd, check=False)
     write_log(log_dir, "evosuite_fixed.log", out, err)
 
     if code != 0:
@@ -173,6 +246,8 @@ def compile_generated_tests(
     junit_jar: Path,
     hamcrest_jar: Path,
     log_dir: Path,
+    docker_image: str | None = None,
+    m2_dir: Path | None = None,
 ) -> None:
     """
     Compile the EvoSuite-generated tests.
@@ -194,7 +269,16 @@ def compile_generated_tests(
 
     cmd = ["javac", "-cp", cp] + [str(p) for p in java_files]
 
-    code, out, err = run_cmd(cmd, cwd=project_dir, check=False)
+    if docker_image:
+        extra = [evosuite_jar]
+        if m2_dir:
+            extra.append(m2_dir)
+        cmd = _docker_prefix(docker_image, project_dir, *extra) + cmd
+        cwd = None
+    else:
+        cwd = project_dir
+
+    code, out, err = run_cmd(cmd, cwd=cwd, check=False)
     write_log(log_dir, "compile_generated_tests.log", out, err)
 
     if code != 0:
@@ -211,6 +295,8 @@ def run_junit(
     hamcrest_jar: Path,
     log_dir: Path,
     log_name: str,
+    docker_image: str | None = None,
+    m2_dir: Path | None = None,
 ) -> bool:
     """
     Run the generated test suite with JUnit.
@@ -227,7 +313,16 @@ def run_junit(
 
     cmd = ["java", "-cp", cp, "org.junit.runner.JUnitCore", test_class]
 
-    code, out, err = run_cmd(cmd, cwd=project_dir, check=False)
+    if docker_image:
+        extra = [tests_dir, evosuite_jar]
+        if m2_dir:
+            extra.append(m2_dir)
+        cmd = _docker_prefix(docker_image, project_dir, *extra) + cmd
+        cwd = None
+    else:
+        cwd = project_dir
+
+    code, out, err = run_cmd(cmd, cwd=cwd, check=False)
     write_log(log_dir, log_name, out, err)
 
     return code == 0
@@ -294,6 +389,8 @@ def main() -> None:
     parser.add_argument("--hamcrest-jar", required=True, help="Path to hamcrest-core-1.3.jar")
     parser.add_argument("--work-root", required=True, help="Directory where checkouts and logs are stored")
     parser.add_argument("--heap", default="4g", help="Heap size for EvoSuite. Default: 4g")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for EvoSuite. Omit for EvoSuite default.")
+    parser.add_argument("--docker-image", default=None, help="Docker image to use for Java steps (e.g. gitbug-java8). Omit to use system Java.")
 
     args = parser.parse_args()
 
@@ -312,6 +409,9 @@ def main() -> None:
     ensure_file(junit_jar, "JUnit jar")
     ensure_file(hamcrest_jar, "Hamcrest jar")
 
+    docker_image = args.docker_image
+    m2_dir = Path.home() / ".m2"
+
     buggy_dir = work_root / "buggy"
     fixed_dir = work_root / "fixed"
     log_dir = work_root / "logs"
@@ -326,7 +426,7 @@ def main() -> None:
     print_changed_java_files(buggy_dir, fixed_dir)
 
     logging.info("Compiling fixed version")
-    cp_fixed = compile_maven_project(fixed_dir, log_dir, "fixed")
+    cp_fixed = compile_maven_project(fixed_dir, log_dir, "fixed", docker_image, m2_dir)
 
     logging.info("Running EvoSuite on fixed version")
     run_evosuite(
@@ -336,6 +436,9 @@ def main() -> None:
         evosuite_jar,
         args.heap,
         log_dir,
+        seed=args.seed,
+        docker_image=docker_image,
+        m2_dir=m2_dir,
     )
 
     logging.info("Compiling generated tests")
@@ -346,6 +449,8 @@ def main() -> None:
         junit_jar,
         hamcrest_jar,
         log_dir,
+        docker_image=docker_image,
+        m2_dir=m2_dir,
     )
 
     test_class = f"{args.class_under_test}_ESTest"
@@ -361,10 +466,12 @@ def main() -> None:
         hamcrest_jar,
         log_dir,
         "run_fixed.log",
+        docker_image=docker_image,
+        m2_dir=m2_dir,
     )
 
     logging.info("Compiling buggy version")
-    cp_buggy = compile_maven_project(buggy_dir, log_dir, "buggy")
+    cp_buggy = compile_maven_project(buggy_dir, log_dir, "buggy", docker_image, m2_dir)
 
     logging.info("Running fixed-generated tests on buggy version")
     buggy_pass = run_junit(
@@ -377,6 +484,8 @@ def main() -> None:
         hamcrest_jar,
         log_dir,
         "run_buggy.log",
+        docker_image=docker_image,
+        m2_dir=m2_dir,
     )
 
     summary = summarize(fixed_pass, buggy_pass)
@@ -384,6 +493,8 @@ def main() -> None:
     print("\n========== SUMMARY ==========")
     print(f"Bug ID:           {args.bug_id}")
     print(f"Class under test: {args.class_under_test}")
+    print(f"Seed:             {args.seed if args.seed is not None else 'default'}")
+    print(f"Java image:       {docker_image if docker_image else 'system'}")
     print(f"Fixed result:     {'PASS' if fixed_pass else 'FAIL'}")
     print(f"Buggy result:     {'PASS' if buggy_pass else 'FAIL'}")
     print(f"Conclusion:       {summary}")
@@ -405,3 +516,22 @@ if __name__ == "__main__":
 
 # cat ../logs/run_fixed.log
 # cat ../logs/run_buggy.log
+
+"""cd /home/atsum/Documents/gitbug-java
+poetry run python /home/atsum/Documents/investigation/run_screened_bugs.py \
+  --bugs-csv /home/atsum/Documents/investigation/bugs_java_assigned.csv \
+  --limit 1 \
+  --seeds 3147383999447 9617663486099 5379124608314 4823761945872 9865472301598 \
+          4098156729301 4378296150428 8912357690412 4082159706387 5017574018895 \
+          3157718788187 8462097531802 8394051763254 7861948975955 5785033018534 \
+          4687593021847 1369827450193 8912045678210 4195939566797 5919993929691 \
+          8492013567021 4629875132408 7245638910523 4823167590241 7237611861410 \
+          4872395016821 4967023185649 6048152937021 9516437924806 8609571234567 \
+  --force"""
+
+# For specific bug
+"""poetry run python /home/atsum/Documents/investigation/run_screened_bugs.py \
+  --bugs-csv /home/atsum/Documents/investigation/bugs_java_assigned.csv \
+  --bug-id Bears-1 \
+  --seeds 3147383999447 9617663486099 ... \
+  --force"""

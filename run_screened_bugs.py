@@ -22,10 +22,38 @@ DEFAULT_BUGS_CSV = Path("/home/atsum/Documents/investigation/bugs.csv")
 RESULTS_CSV = BASE_WORK_ROOT / "results.csv"
 
 
+# Docker image to use per Java version.
+# Build them once with: bash docker/build.sh
+JAVA_DOCKER_IMAGES = {
+    8: "gitbug-java8",
+    11: "gitbug-java11",
+}
+
+# First 5 seeds from the experiment seed list (K=5 for initial runs).
+DEFAULT_SEEDS = [
+    3147383999447,
+    9617663486099,
+    5379124608314,
+    4823761945872,
+    9865472301598,
+]
+
+# Full list of 30 seeds available for larger experiments.
+ALL_SEEDS = [
+    3147383999447, 9617663486099, 5379124608314, 4823761945872, 9865472301598,
+    4098156729301, 4378296150428, 8912357690412, 4082159706387, 5017574018895,
+    3157718788187, 8462097531802, 8394051763254, 7861948975955, 5785033018534,
+    4687593021847, 1369827450193, 8912045678210, 4195939566797, 5919993929691,
+    8492013567021, 4629875132408, 7245638910523, 4823167590241, 7237611861410,
+    4872395016821, 4967023185649, 6048152937021, 9516437924806, 8609571234567,
+]
+
 # Column order for the final results file.
 FIELDNAMES = [
     "bug_id",
     "class_under_test",
+    "seed",
+    "java_version",
     "exit_code",
     "fixed_result",
     "buggy_result",
@@ -75,13 +103,14 @@ def setup_java_env() -> None:
         os.environ["PATH"] = f"{java_home / 'bin'}:{os.environ.get('PATH', '')}"
 
 
-def bug_key(bug_id: str, class_under_test: str) -> str:
+def bug_key(bug_id: str, class_under_test: str, seed: int, java_version: int) -> str:
     """
-    Unique key for one bug-class experiment.
+    Unique key for one bug-class-seed-javaversion experiment.
 
-    This matters because the same bug can touch more than one Java class.
+    This matters because the same bug can touch more than one Java class,
+    each seed is an independent run, and Java 8 vs 11 are separate experiments.
     """
-    return f"{bug_id}::{class_under_test}"
+    return f"{bug_id}::{class_under_test}::{seed}::java{java_version}"
 
 
 def load_bugs(csv_path: Path) -> List[Dict[str, str]]:
@@ -107,10 +136,14 @@ def load_bugs(csv_path: Path) -> List[Dict[str, str]]:
             if not bug_id or not class_under_test:
                 continue
 
-            bugs.append({
+            entry: Dict[str, str] = {
                 "bug_id": bug_id,
                 "class_under_test": class_under_test,
-            })
+            }
+            java_version = row.get("java_version", "").strip()
+            if java_version:
+                entry["java_version"] = java_version
+            bugs.append(entry)
 
     return bugs
 
@@ -133,13 +166,15 @@ def load_completed_keys(results_csv: Path) -> Set[str]:
         for row in reader:
             bug_id = row.get("bug_id", "").strip()
             class_under_test = row.get("class_under_test", "").strip()
+            seed_str = row.get("seed", "").strip()
+            java_version_str = row.get("java_version", "").strip()
             result = row.get("result", "").strip()
 
-            if not bug_id or not class_under_test:
+            if not bug_id or not class_under_test or not seed_str or not java_version_str:
                 continue
 
             if result not in {"RUNNER ERROR", "TIMEOUT", ""}:
-                completed.add(bug_key(bug_id, class_under_test))
+                completed.add(bug_key(bug_id, class_under_test, int(seed_str), int(java_version_str)))
 
     return completed
 
@@ -267,9 +302,9 @@ def cleanup_targets(work_root: Path) -> None:
             shutil.rmtree(target_dir, ignore_errors=True)
 
 
-def run_one_bug(bug: Dict[str, str], timeout_seconds: int, heap: str) -> Dict[str, str]:
+def run_one_bug(bug: Dict[str, str], seed: int, java_version: int, timeout_seconds: int, heap: str) -> Dict[str, str]:
     """
-    Run one bug-class experiment.
+    Run one bug-class-seed experiment.
 
     This calls gitbug_evosuite_runner.py, which handles the actual workflow:
     checkout buggy/fixed, compile, run EvoSuite, compile tests, and compare
@@ -278,13 +313,14 @@ def run_one_bug(bug: Dict[str, str], timeout_seconds: int, heap: str) -> Dict[st
     bug_id = bug["bug_id"]
     class_under_test = bug["class_under_test"]
 
-    # Include the class name in the folder so the same bug can be tested
-    # against multiple changed classes without overwriting previous results.
+    # Each seed+java_version combination gets its own folder.
     safe_class = class_under_test.replace(".", "_").replace("$", "_")
-    work_root = BASE_WORK_ROOT / f"{bug_id}__{safe_class}"
+    work_root = BASE_WORK_ROOT / f"{bug_id}__{safe_class}__seed_{seed}__java{java_version}"
 
     logs_dir = work_root / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
+
+    docker_image = JAVA_DOCKER_IMAGES.get(java_version)
 
     cmd = [
         sys.executable,
@@ -305,7 +341,12 @@ def run_one_bug(bug: Dict[str, str], timeout_seconds: int, heap: str) -> Dict[st
         str(work_root),
         "--heap",
         heap,
+        "--seed",
+        str(seed),
     ]
+
+    if docker_image:
+        cmd += ["--docker-image", docker_image]
 
     # Save the exact command used. This makes reruns/debugging easier.
     with open(logs_dir / "batch_command.txt", "w", encoding="utf-8") as f:
@@ -327,6 +368,8 @@ def run_one_bug(bug: Dict[str, str], timeout_seconds: int, heap: str) -> Dict[st
     return {
         "bug_id": bug_id,
         "class_under_test": class_under_test,
+        "seed": str(seed),
+        "java_version": str(java_version),
         "exit_code": str(exit_code),
         "fixed_result": extract_summary_value(stdout, "Fixed result"),
         "buggy_result": extract_summary_value(stdout, "Buggy result"),
@@ -373,6 +416,20 @@ def main() -> None:
         action="store_true",
         help="Delete Maven target/ folders after each bug",
     )
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=DEFAULT_SEEDS,
+        help="List of EvoSuite seeds to run per bug. Default: first 5 seeds.",
+    )
+    parser.add_argument(
+        "--java-versions",
+        nargs="+",
+        type=int,
+        default=[8, 11],
+        help="Java versions to test per bug. Each version uses its Docker image. Default: 8 11",
+    )
 
     args = parser.parse_args()
 
@@ -384,67 +441,96 @@ def main() -> None:
     if args.limit > 0:
         bugs = bugs[:args.limit]
 
+    seeds = args.seeds
+    global_java_versions = args.java_versions
+
+    # If the bugs CSV has a java_version column, use it per-row (one version
+    # per bug) instead of looping over --java-versions globally.
+    per_bug_versions = any("java_version" in bug for bug in bugs)
+
+    if per_bug_versions:
+        total_runs = sum(len(seeds) for _ in bugs)
+        version_note = "per-bug (from CSV)"
+    else:
+        total_runs = len(bugs) * len(seeds) * len(global_java_versions)
+        version_note = str(global_java_versions)
+
     completed = set() if args.force else load_completed_keys(RESULTS_CSV)
 
-    print(f"Loaded {len(bugs)} bug(s).")
-    print(f"Results CSV: {RESULTS_CSV}")
-    print(f"Timeout per bug: {args.timeout} seconds")
+    print(f"Loaded {len(bugs)} bug(s) x {len(seeds)} seed(s) = {total_runs} total runs.")
+    print(f"Seeds:         {seeds}")
+    print(f"Java versions: {version_note}")
+    print(f"Results CSV:   {RESULTS_CSV}")
+    print(f"Timeout per run: {args.timeout} seconds")
     print(f"Heap: {args.heap}")
 
-    for index, bug in enumerate(bugs, start=1):
+    run_index = 0
+    for bug in bugs:
         bug_id = bug["bug_id"]
         class_under_test = bug["class_under_test"]
-        key = bug_key(bug_id, class_under_test)
 
-        print(f"\n[{index}/{len(bugs)}] {bug_id} :: {class_under_test}")
+        # Per-bug version from CSV takes priority over --java-versions.
+        if per_bug_versions:
+            versions_for_bug = [int(bug["java_version"])]
+        else:
+            versions_for_bug = global_java_versions
 
-        if key in completed:
-            print("  SKIPPED: already completed. Use --force to rerun.")
-            continue
+        for java_version in versions_for_bug:
+            for seed in seeds:
+                run_index += 1
+                key = bug_key(bug_id, class_under_test, seed, java_version)
 
-        try:
-            result = run_one_bug(
-                bug,
-                timeout_seconds=args.timeout,
-                heap=args.heap,
-            )
+                print(f"\n[{run_index}/{total_runs}] {bug_id} :: {class_under_test} :: seed={seed} :: java={java_version}")
 
-        except Exception as e:
-            # This catches unexpected Python-level errors in the batch script.
-            # Errors inside the worker usually appear in batch_driver_stdout_stderr.log.
-            safe_class = class_under_test.replace(".", "_").replace("$", "_")
-            work_root = BASE_WORK_ROOT / f"{bug_id}__{safe_class}"
-            logs_dir = work_root / "logs"
-            logs_dir.mkdir(parents=True, exist_ok=True)
+                if key in completed:
+                    print("  SKIPPED: already completed. Use --force to rerun.")
+                    continue
 
-            result = {
-                "bug_id": bug_id,
-                "class_under_test": class_under_test,
-                "exit_code": "-1",
-                "fixed_result": "",
-                "buggy_result": "",
-                "result": "RUNNER ERROR",
-                "conclusion": str(e),
-                "work_root": str(work_root),
-                "logs_dir": str(logs_dir),
-            }
+                try:
+                    result = run_one_bug(
+                        bug,
+                        seed=seed,
+                        java_version=java_version,
+                        timeout_seconds=args.timeout,
+                        heap=args.heap,
+                    )
 
-            with open(logs_dir / "batch_driver_exception.log", "w", encoding="utf-8") as f:
-                f.write(str(e) + "\n")
+                except Exception as e:
+                    safe_class = class_under_test.replace(".", "_").replace("$", "_")
+                    work_root = BASE_WORK_ROOT / f"{bug_id}__{safe_class}__seed_{seed}__java{java_version}"
+                    logs_dir = work_root / "logs"
+                    logs_dir.mkdir(parents=True, exist_ok=True)
 
-        append_result(RESULTS_CSV, result)
+                    result = {
+                        "bug_id": bug_id,
+                        "class_under_test": class_under_test,
+                        "seed": str(seed),
+                        "java_version": str(java_version),
+                        "exit_code": "-1",
+                        "fixed_result": "",
+                        "buggy_result": "",
+                        "result": "RUNNER ERROR",
+                        "conclusion": str(e),
+                        "work_root": str(work_root),
+                        "logs_dir": str(logs_dir),
+                    }
 
-        print(
-            f"  fixed={result['fixed_result'] or '?'} | "
-            f"buggy={result['buggy_result'] or '?'} | "
-            f"result={result['result']}"
-        )
-        print(f"  logs={result['logs_dir']}")
+                    with open(logs_dir / "batch_driver_exception.log", "w", encoding="utf-8") as f:
+                        f.write(str(e) + "\n")
 
-        if args.cleanup_targets:
-            cleanup_targets(Path(result["work_root"]))
+                append_result(RESULTS_CSV, result)
 
-    print("\nDone.")
+                print(
+                    f"  fixed={result['fixed_result'] or '?'} | "
+                    f"buggy={result['buggy_result'] or '?'} | "
+                    f"result={result['result']}"
+                )
+                print(f"  logs={result['logs_dir']}")
+
+                if args.cleanup_targets:
+                    cleanup_targets(Path(result["work_root"]))
+
+    print(f"\nDone. {run_index} runs attempted.")
     print(f"Saved incremental results to: {RESULTS_CSV}")
 
 
