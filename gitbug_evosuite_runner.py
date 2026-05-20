@@ -182,6 +182,7 @@ def run_evosuite(
     seed: int | None = None,
     docker_image: str | None = None,
     m2_dir: Path | None = None,
+    evosuite_port: int | None = None,
 ) -> None:
     """
     Run EvoSuite on the fixed version.
@@ -193,9 +194,14 @@ def run_evosuite(
 
     It should create an evosuite-tests/ folder with generated JUnit tests.
     """
-    cmd = [
-        "java",
-        f"-Xmx{heap}",
+    cmd = ["java", f"-Xmx{heap}"]
+
+    # -Dstarting_port is a JVM system property read by EvoSuite's RMI layer,
+    # not an EvoSuite CLI option — it must go before -jar.
+    if evosuite_port is not None:
+        cmd += [f"-Dstarting_port={evosuite_port}"]
+
+    cmd += [
         "-jar",
         str(evosuite_jar),
         "-class",
@@ -341,7 +347,7 @@ def print_changed_java_files(buggy_dir: Path, fixed_dir: Path) -> None:
     if not buggy_src.is_dir() or not fixed_src.is_dir():
         return
 
-    code, out, err = run_cmd(
+    _, out, err = run_cmd(
         ["diff", "-rq", str(buggy_src), str(fixed_src)],
         check=False,
     )
@@ -391,6 +397,8 @@ def main() -> None:
     parser.add_argument("--heap", default="4g", help="Heap size for EvoSuite. Default: 4g")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for EvoSuite. Omit for EvoSuite default.")
     parser.add_argument("--docker-image", default=None, help="Docker image to use for Java steps (e.g. gitbug-java8). Omit to use system Java.")
+    parser.add_argument("--evosuite-port", type=int, default=None,
+                        help="Starting RMI port for EvoSuite (e.g. 40000). Use to avoid port conflicts in parallel runs.")
 
     args = parser.parse_args()
 
@@ -439,6 +447,7 @@ def main() -> None:
         seed=args.seed,
         docker_image=docker_image,
         m2_dir=m2_dir,
+        evosuite_port=args.evosuite_port,
     )
 
     logging.info("Compiling generated tests")
