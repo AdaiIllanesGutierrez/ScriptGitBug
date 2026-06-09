@@ -470,6 +470,16 @@ def _run_check() -> None:
         if not ok:
             all_ok = False
 
+    print("\n── Python packages ──────────────────────────────────────────────")
+    rc = subprocess.run(
+        [sys.executable, "-c", "import pygit2"],
+        capture_output=True,
+    ).returncode
+    ok = rc == 0
+    icon = "✓" if ok else "!"
+    status = "OK" if ok else "NOT FOUND — needed for --checkout-mode json (pip install pygit2)"
+    print(f"  {icon}  pygit2 (optional): [{status}]")
+
     print()
     if all_ok:
         print("All checks passed. Ready to run.")

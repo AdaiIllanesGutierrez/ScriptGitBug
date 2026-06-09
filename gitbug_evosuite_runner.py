@@ -120,6 +120,87 @@ def checkout_version(gitbug_repo: Path, bug_id: str, out_dir: Path, fixed: bool)
     run_cmd(cmd, cwd=gitbug_repo)
 
 
+def checkout_version_json(gitbug_repo: Path, bug_id: str, out_dir: Path, fixed: bool) -> None:
+    """
+    Checkout either the buggy or fixed version directly from the JSON data files.
+
+    Unlike checkout_version(), this does not require poetry or the gitbug-java
+    CLI. It reads the bug metadata from data/bugs/*.json, clones the repo via
+    pygit2, and applies the relevant patches for the buggy version.
+    """
+    import json
+    import pygit2
+    import uuid
+
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+
+    bugs_dir = gitbug_repo / "data" / "bugs"
+    commit_short = bug_id.split("-")[-1]
+
+    bug_data = None
+    for json_file in bugs_dir.glob("*.json"):
+        with open(json_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("commit_hash", "").startswith(commit_short):
+                    bug_data = data
+                    break
+        if bug_data is not None:
+            break
+
+    if bug_data is None:
+        raise RuntimeError(f"No JSON entry found for bug_id: {bug_id}")
+
+    clone_url = bug_data["clone_url"]
+    commit_hash = bug_data["commit_hash"]
+    previous_commit_hash = bug_data["previous_commit_hash"]
+    test_patch = bug_data.get("test_patch", "")
+    non_code_patch = bug_data.get("non_code_patch", "")
+    bug_patch = bug_data.get("bug_patch", "")
+
+    logging.info(f"Cloning {clone_url} → {out_dir}")
+    repo = pygit2.clone_repository(clone_url, str(out_dir))
+
+    subprocess.run(["git", "config", "gc.auto", "0"], cwd=str(out_dir), capture_output=True)
+
+    def set_commit(target_hash: str) -> None:
+        commit = repo.revparse_single(target_hash)
+        repo.checkout_tree(commit)
+        repo.create_tag(
+            str(uuid.uuid4()),
+            commit.id,
+            pygit2.GIT_OBJECT_COMMIT,
+            commit.author,
+            commit.message,
+        )
+        repo.set_head(commit.id)
+
+    if fixed:
+        set_commit(commit_hash)
+    else:
+        set_commit(previous_commit_hash)
+        if non_code_patch and bug_patch:
+            repo.apply(pygit2.Diff.parse_diff(non_code_patch))
+        if test_patch:
+            repo.apply(pygit2.Diff.parse_diff(test_patch))
+
+    workflows_dir = out_dir / ".github" / "workflows"
+    if workflows_dir.exists():
+        for wf in list(workflows_dir.glob("*.yml")) + list(workflows_dir.glob("*.yaml")):
+            wf.unlink()
+
+    bug_data["fixed"] = fixed
+    with open(out_dir / "gitbug.json", "w") as f:
+        json.dump(bug_data, f)
+
+
 def compile_maven_project(
     project_dir: Path,
     log_dir: Path,
@@ -172,6 +253,122 @@ def compile_maven_project(
     return cp
 
 
+def compile_gradle_project(
+    project_dir: Path,
+    log_dir: Path,
+    prefix: str,
+    docker_image: str | None = None,
+    m2_dir: Path | None = None,
+) -> str:
+    """
+    Compile a Gradle project and build its dependency classpath.
+
+    Uses ./gradlew to compile, then injects a temporary init script to
+    collect the runtimeClasspath into cp.txt — the same format Maven uses.
+
+    Returns a classpath string pointing to Gradle's build output + dependencies.
+    """
+    gradle_cache = Path.home() / ".gradle"
+    extra = []
+    if m2_dir:
+        extra.append(m2_dir)
+    if docker_image and gradle_cache.exists():
+        extra.append(gradle_cache)
+
+    prefix_docker = _docker_prefix(docker_image, project_dir, *extra) if docker_image else []
+    cwd = None if docker_image else project_dir
+
+    gradlew = project_dir / "gradlew"
+    gradlew.chmod(0o755)
+    gradle_cmd = [str(gradlew)]
+
+    # Step 1: compile
+    code, out, err = run_cmd(
+        prefix_docker + gradle_cmd + ["--no-daemon", "-q", "classes"],
+        cwd=cwd,
+        check=False,
+    )
+    write_log(log_dir, f"{prefix}_gradle_compile.log", out, err)
+
+    if code != 0:
+        raise RuntimeError(f"Gradle compile failed for {project_dir}")
+
+    # Step 2: collect classpath via a temporary init script.
+    # The script defines a task that resolves runtimeClasspath/compileClasspath
+    # and writes all jar paths to cp.txt in the project root.
+    init_script = """\
+allprojects {
+    task evosuite_cp {
+        doLast {
+            def cp = [] as LinkedHashSet
+            try { cp += configurations.runtimeClasspath.resolve() } catch(ignored) {}
+            try { cp += configurations.compileClasspath.resolve() } catch(ignored) {}
+            new File(rootProject.rootDir, 'cp.txt').text = cp.collect { it.absolutePath }.unique().join(':')
+        }
+    }
+}
+"""
+    init_file = project_dir / "_evosuite_init.gradle"
+    init_file.write_text(init_script, encoding="utf-8")
+
+    try:
+        code, out, err = run_cmd(
+            prefix_docker + gradle_cmd + [
+                "--no-daemon", "-q",
+                "--no-configuration-cache",
+                "--init-script", str(init_file),
+                "evosuite_cp",
+            ],
+            cwd=cwd,
+            check=False,
+        )
+        write_log(log_dir, f"{prefix}_gradle_classpath.log", out, err)
+
+        if code != 0:
+            raise RuntimeError(f"Gradle classpath collection failed for {project_dir}")
+    finally:
+        init_file.unlink(missing_ok=True)
+
+    cp_txt = project_dir / "cp.txt"
+    ensure_file(cp_txt, "cp.txt")
+
+    deps = cp_txt.read_text(encoding="utf-8").strip()
+
+    # Gradle puts compiled classes in build/classes/java/main/ by default.
+    classes_dir = project_dir / "build" / "classes" / "java" / "main"
+    if not classes_dir.is_dir():
+        for alt in ["build/classes/groovy/main", "build/classes/kotlin/main"]:
+            candidate = project_dir / alt
+            if candidate.is_dir():
+                classes_dir = candidate
+                break
+
+    cp = f"{classes_dir}:{deps}" if deps else str(classes_dir)
+    return cp
+
+
+def compile_project(
+    project_dir: Path,
+    log_dir: Path,
+    prefix: str,
+    docker_image: str | None = None,
+    m2_dir: Path | None = None,
+) -> str:
+    """
+    Compile a project using Maven or Gradle, auto-detected from the project root.
+
+    Returns a classpath string including compiled classes and dependencies.
+    """
+    if (project_dir / "pom.xml").is_file():
+        logging.info(f"Detected Maven project at {project_dir}")
+        return compile_maven_project(project_dir, log_dir, prefix, docker_image, m2_dir)
+    elif (project_dir / "build.gradle").is_file() or (project_dir / "build.gradle.kts").is_file():
+        logging.info(f"Detected Gradle project at {project_dir}")
+        return compile_gradle_project(project_dir, log_dir, prefix, docker_image, m2_dir)
+    else:
+        raise RuntimeError(f"No pom.xml or build.gradle found in {project_dir} — cannot compile.")
+
+
 def run_evosuite(
     fixed_dir: Path,
     classpath: str,
@@ -183,6 +380,7 @@ def run_evosuite(
     docker_image: str | None = None,
     m2_dir: Path | None = None,
     evosuite_port: int | None = None,
+    no_junit_check: bool = False,
 ) -> None:
     """
     Run EvoSuite on the fixed version.
@@ -212,6 +410,11 @@ def run_evosuite(
 
     if seed is not None:
         cmd += ["-seed", str(seed)]
+
+    # Skip assertion minimization (which uses RMI and crashes on Java 11).
+    # Tests are written immediately after the search with all assertions included.
+    if no_junit_check:
+        cmd += ["-Djunit_check=false"]
 
     if docker_image:
         extra = [evosuite_jar]
@@ -399,6 +602,12 @@ def main() -> None:
     parser.add_argument("--docker-image", default=None, help="Docker image to use for Java steps (e.g. gitbug-java8). Omit to use system Java.")
     parser.add_argument("--evosuite-port", type=int, default=None,
                         help="Starting RMI port for EvoSuite (e.g. 40000). Use to avoid port conflicts in parallel runs.")
+    parser.add_argument("--no-junit-check", action="store_true",
+                        help="Pass -Djunit_check=false to EvoSuite. Skips assertion minimization "
+                             "(which uses RMI and crashes on Java 11). Tests are noisier but will be written to disk.")
+    parser.add_argument("--checkout-mode", choices=["cli", "json"], default="cli",
+                        help="How to checkout bugs. 'cli' uses the gitbug-java CLI (requires poetry). "
+                             "'json' reads data/bugs/*.json directly via pygit2 (no poetry needed). Default: cli")
 
     args = parser.parse_args()
 
@@ -425,16 +634,18 @@ def main() -> None:
     log_dir = work_root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    logging.info("Checking out buggy version")
-    checkout_version(gitbug_repo, args.bug_id, buggy_dir, fixed=False)
+    _checkout = checkout_version_json if args.checkout_mode == "json" else checkout_version
 
-    logging.info("Checking out fixed version")
-    checkout_version(gitbug_repo, args.bug_id, fixed_dir, fixed=True)
+    logging.info(f"Checking out buggy version (mode={args.checkout_mode})")
+    _checkout(gitbug_repo, args.bug_id, buggy_dir, fixed=False)
+
+    logging.info(f"Checking out fixed version (mode={args.checkout_mode})")
+    _checkout(gitbug_repo, args.bug_id, fixed_dir, fixed=True)
 
     print_changed_java_files(buggy_dir, fixed_dir)
 
     logging.info("Compiling fixed version")
-    cp_fixed = compile_maven_project(fixed_dir, log_dir, "fixed", docker_image, m2_dir)
+    cp_fixed = compile_project(fixed_dir, log_dir, "fixed", docker_image, m2_dir)
 
     logging.info("Running EvoSuite on fixed version")
     run_evosuite(
@@ -448,6 +659,7 @@ def main() -> None:
         docker_image=docker_image,
         m2_dir=m2_dir,
         evosuite_port=args.evosuite_port,
+        no_junit_check=args.no_junit_check,
     )
 
     logging.info("Compiling generated tests")
@@ -480,7 +692,7 @@ def main() -> None:
     )
 
     logging.info("Compiling buggy version")
-    cp_buggy = compile_maven_project(buggy_dir, log_dir, "buggy", docker_image, m2_dir)
+    cp_buggy = compile_project(buggy_dir, log_dir, "buggy", docker_image, m2_dir)
 
     logging.info("Running fixed-generated tests on buggy version")
     buggy_pass = run_junit(

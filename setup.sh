@@ -28,6 +28,16 @@ check_cmd python3
 check_cmd poetry
 check_cmd java
 
+echo ""
+echo "── Optional Python packages ─────────────────────────"
+
+if python3 -c "import pygit2" &>/dev/null; then
+    ok "pygit2 found (enables --checkout-mode json)"
+else
+    warn "pygit2 not found — only needed for --checkout-mode json"
+    warn "Install with: pip install pygit2"
+fi
+
 # ── 2. gitbug-java repo ───────────────────────────────────────────────────────
 echo ""
 echo "── gitbug-java repo ─────────────────────────"
