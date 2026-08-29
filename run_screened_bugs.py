@@ -391,6 +391,8 @@ def run_one_bug(
         heap,
         "--seed",
         str(seed),
+        "--checkout-mode",
+        "json",
     ]
 
     if docker_image:
