@@ -18,8 +18,10 @@ from pathlib import Path
 from collections import Counter
 
 
-RESULTS_CSV = Path("/home/atsum/Documents/gitbug-batch/results.csv")
-DEFAULT_OUT = Path("/home/atsum/Documents/investigation/evosuite_failures_analysis.csv")
+_SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = _SCRIPT_DIR.parent.parent
+RESULTS_CSV = PROJECT_ROOT / "resultados" / "MUTATION" / "results.csv"
+DEFAULT_OUT = PROJECT_ROOT / "resultados" / "evosuite_failures_analysis.csv"
 
 FIELDNAMES_OUT = [
     "bug_id",

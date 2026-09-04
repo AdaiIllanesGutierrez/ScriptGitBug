@@ -30,7 +30,7 @@ JUNIT_JAR    = _find_jar("junit/junit/*/junit-[0-9]*.jar")
 HAMCREST_JAR = _find_jar("org/hamcrest/hamcrest-core/*/hamcrest-core-[0-9]*.jar")
 
 BASE_WORK_ROOT   = Path.home() / "gitbug-batch"
-DEFAULT_BUGS_CSV = _SCRIPT_DIR / "bugs_java_assigned.csv"
+DEFAULT_BUGS_CSV = _SCRIPT_DIR.parent / "data" / "bugs_java_assigned.csv"
 RESULTS_CSV      = BASE_WORK_ROOT / "results.csv"
 
 
